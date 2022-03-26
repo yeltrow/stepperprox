@@ -1,0 +1,469 @@
+component stepperprox "Stepper Index Prox Monitor";
+author "Matt Wortley";
+license "GPLv2 or later";
+description """
+Uses a proximity sensor on the leadscrew of a linear axis to enhance 
+homing and detect missed steps.  It ehances homing by latching the 
+homing switch output until the centerpoint of the slug on the leadscrew 
+is crossed.  It also provides fault indication if the proximity sensor
+timing changes due to missed steps during run.  It makes up for some of
+the features lost when using stepper motors instead of servo motors.""";
+
+pin in bit resetCmd "resets component state to defaults.";
+
+pin in bit prox """
+Proximity sensor input. Should go high one time per cycle of the 
+leadscrew.  Installing a setscrew into the side of a leadscrew and 
+positioning the prox to pick it up is a good way to generate this 
+signal.""";
+
+pin in bit jointHoming """
+Connect to joint.N.homing so the component can be sure to reset itself
+to the correct state when the joint is not homing.  It is not strictly
+necessary, but guards for some edge cases.""";
+
+pin in bit home_sw_in """
+Connect to the raw, mechanical home switch or a debounced version of
+it.  Expects TRUE when the switch is hit.  Disconnect this switch from 
+joint.N.home-sw-in.  Use the home-sw-out pin provided by this component
+for that signal instead..""";
+
+pin out bit home_sw_out """
+Provides the output to the joint controlller.  Connect to joint.N.home-sw-in.
+This pin replaces the signal from the raw home switch that would go to 
+the joint.  It triggers when the home switch input activates, but then
+holds it until the prox switch has crossed its centerpoint.  This allows
+for very accurate homing, even if the sensitivity of the prox switch has
+changed due to temperature changes.""";
+
+pin out bit centerPosCrossed "Is high for one cycle when the middle of slug is crossed.";
+
+pin out unsigned fault_index_pulse_unexpected 
+"""Fault indication.  It triggers when the edge of the 
+prox pulse occurs at different distance than unitsPerRev. This is 
+caused either by missed steps/jamming or by unitsPerRev being set to
+something other than the distance traveled by a complete rotation of the
+leadscrew.""";
+
+pin out unsigned fault_no_prox_before_homesw
+"""Fault indication.  The proximity switch must experience a pulse in
+both directions of screw rotation to be able to calculate the center
+point of the slug accurately.  If the prox doesn't get pulsed before 
+the home switch is hit, the code does not know when to unlatch the home
+switch.  Check the starting position before homing to make sure it is a
+full revolution away from the home switch.""";
+
+pin out unsigned fault_missing_prox_pulse 
+"""Fault indication.  The proximity switch has not been seen in more 
+than 1.5 * unitsPerRev units of travel.  This can be caused by 
+improperly setting unitsPerRev or prox pulese are not coming in at all.
+A large number of missing steps or an intermittent connection on the 
+prox could also be to blame.""";
+
+ 
+pin out unsigned fault_center_pos_seek_failure  
+"""Fault indication.  The homing latch was held for 1.5 * unitsPerRev 
+since the home switch was released, but never crossed a calculated
+centerpoint of the prox. Potentials Causes \n 
+- the prox was not tripped at least once while rotating toward the home switch.\n
+- improperly setting unitsPerRev \n
+- prox pulese are not coming in at all \n
+- large number of missing steps or an intermittent connection on the 
+prox.""";
+
+
+pin in float position "joint position from joint.N.pos-cmd.";
+
+pin in float position_tolerance = 0.005 
+"""Set to a value that should not be exceeded during normal run without
+missed steps. If the toleranace is exceeded, a fault will be set.  It is
+up to you as a user to have the machine act appropriately when this 
+condition occurs.  Tying to joint.N.amp-fault-in is a way to handle
+this.  It will cause skipped steps everywhere if the amp-fualt-in
+line is used.  Rehoming will be necessary afterwards. """;
+
+pin in float vel_cmd "joint velocity from joint.N.vel-cmd.";
+
+pin out float indexPulseSpacingError "Difference from center of index to initial center of index.";
+pin out float debugState "internal state of the component for debugging purposes and tests.";
+pin out float testCounter=0 "Counter used for debugging. Increments each time it is called.";
+
+param rw float unitsPerRev = 0.200 "units between prox pulses";
+
+pin out float edgePos "Edge position when shaft is rotating in the positive direction";
+
+pin out float errorPos 
+"""Differrence between the position of the last positve edge and the very
+first one ever found.""";
+
+pin out float errorPosMax "Maximum Pos Edge Error."; 
+
+pin out float edgeNeg "Edge position when shaft is rotating in the negative direction";
+pin out float errorNeg 
+"""Differrence between the position of the last negative edge and the very
+first one ever found.""";
+
+pin out float errorNegMax "Maximum Neg Edge Error.";
+pin out float centerPos = -1 "center of the prox pulse";
+pin out float switchDirection "direction the switch is in pos or neg";
+pin out float velocitySign "sign of our current movement pos or neg";
+pin out float debug_float = -1 "internal debugging pin";
+function _ ;
+;;
+
+float rollover_convert( float value, float upr);
+
+  // States
+  
+#define UNINTIALIZED 0  			// Reset - Uninitialized
+#define INIT_DONE 1		 		// Init complete, just hanging out
+#define TRAVELING_NO_LIM_SW 2 		// Traveling around 
+#define TRAVELING_INTO_SWITCH 4 	// Found switch, grinding into it.
+#define REVERSED_EXITING_SWITCH 8   // Switch Encountered - traveling off the end of it.
+#define REVERSED_HUNTING_PROX 16    // Switch Encountered - toward switch edges found
+#define HOLDING_UNTIL_CENTERPOINT 32 // Latching until centerpoint is found
+#define HOME_SEQUENCE_DONE 64		// Latching done, go about business.
+  
+#include <math.h>
+#define TOWARDS_SWITCH 1
+#define AWAY_FROM_SWITCH 2
+#define NOT_SURE_SWITCH_DIRECTION 3
+#define IS_POSITIVE 1
+#define IS_NEGATIVE -1
+
+
+FUNCTION(_) {
+  static int motionHappenedWithZeroProx = 0;
+  static int LimSwitchLatcherState;
+  static float lastPos;
+  static float lastLinearPos;
+  static int negEdgeInitializedFlag = 0;
+  static int posEdgeInitializedFlag = 0;
+  
+  static float initialEdgePos = 0;  // The last time the prox encountered
+                              // the prox what the position of the 
+                              // leadscrew was.
+  static float initialEdgeNeg = 0;  // Decreasing old edge position.
+  
+  static float home_sw_last_detected_lin_position;
+  
+  static int centerPosInitializedFlag = 0;
+  static int guardingLostStepsFlag = 0;
+  int homeSwitchLatched = FALSE;  // left volatile, because latching should be done
+							  // by the state machine state, not another flag.
+
+  static float initialCenterPos = 0;
+  
+  static int selfInitCompletedFlag = 0;
+  static int lastProx;
+  static int lastHomeSw; // Last cycle value of the home switch so we can detect edges.
+  
+  float currentPos;
+  int travelDirection;
+  int proxEdgeJustOcurredFlag = 0 ;
+  int currentPosLessThanCenter;
+  static int lastPosLessThanCenter;
+      
+  debugState = 0;
+
+  // if we startup linuxcnc on the prox switch, we will get a detected prox edge
+  // when we shouldn't.  
+  if (( vel_cmd != 0 ) && ( prox == 0 ) )
+  {
+	// we have been moving without the prox active;
+	motionHappenedWithZeroProx = 1;
+  }
+  
+  if (vel_cmd >= 0) velocitySign = IS_POSITIVE;
+  else velocitySign = IS_NEGATIVE;
+  
+  // ALL STATES EXIT FOR RESETCMD
+  if ( resetCmd ) LimSwitchLatcherState = UNINTIALIZED;
+  
+  if ( LimSwitchLatcherState == UNINTIALIZED ) 
+  {
+    
+	negEdgeInitializedFlag = 0;
+	posEdgeInitializedFlag = 0;
+	errorPosMax = 0;
+	errorNegMax = 0;
+	guardingLostStepsFlag = 0;
+	initialCenterPos = 0;
+	indexPulseSpacingError = 0;
+	selfInitCompletedFlag = 1;
+	homeSwitchLatched = 0;
+	proxEdgeJustOcurredFlag = 0;
+	LimSwitchLatcherState = INIT_DONE;
+	fault_no_prox_before_homesw = 0;
+	fault_index_pulse_unexpected = 0;
+	fault_missing_prox_pulse = 0;
+	fault_center_pos_seek_failure = FALSE;
+	lastLinearPos = position;
+  }	
+  
+
+  if ((fabs( position - lastLinearPos )) > ( 1.5 * unitsPerRev )) {
+	fault_missing_prox_pulse++;
+  }
+  
+  // Always calculate the current position as a positive modulo 
+  // regardless of negative or positive side of travel
+  currentPos = fmod(position, unitsPerRev);
+  if ( currentPos < 0 ) 
+  { 
+	currentPos = currentPos + unitsPerRev;
+  }
+
+  debug_float = currentPos;
+  
+  currentPosLessThanCenter = ( ( currentPos  < centerPos ) );
+  
+  
+  
+  centerPosCrossed = 0;
+  
+  // if there is a large difference between the last position
+  // and the current we have rolled over
+  if ( fabs(currentPos - lastPos) > (0.5 * unitsPerRev ) )  
+  {
+	// we have crossed the rollover discontinuity 
+	if (((rollover_convert(currentPos, unitsPerRev) < rollover_convert(centerPos, unitsPerRev)) &&
+		(rollover_convert(centerPos, unitsPerRev) < rollover_convert(lastPos, unitsPerRev)) ) || 
+		((rollover_convert(currentPos, unitsPerRev) > rollover_convert(centerPos, unitsPerRev)) &&
+		(rollover_convert(centerPos, unitsPerRev) > rollover_convert(lastPos, unitsPerRev)) )) 
+		centerPosCrossed = 1;
+  }
+  else {
+    // we are in a continuous part of the number line
+    if (((currentPos < centerPos) &&
+		(centerPos  < lastPos)) || 
+		((currentPos > centerPos) &&
+		( centerPos > lastPos)))
+		centerPosCrossed = 1;
+  }
+ 
+  if (centerPosCrossed == 1) testCounter++;
+ 
+  if  ((lastProx == 0) && (prox == 1) && ( motionHappenedWithZeroProx ==TRUE ) )
+  {
+	proxEdgeJustOcurredFlag = TRUE;
+	lastLinearPos = position;  // update the last position we saw the prox switch
+	                           // alive.  
+  }
+
+  // Any time we encounter a prox edge, capture it and calculate the
+  // Center value
+  if ( proxEdgeJustOcurredFlag )
+  {
+	  if ( velocitySign == IS_POSITIVE ){
+		edgePos = currentPos;
+		if ( posEdgeInitializedFlag == 0 ) {
+			initialEdgePos = edgePos;
+			errorPos = 0;
+			errorPosMax = 0;
+		}
+		else {
+			errorPos = initialEdgePos - edgePos;
+			if ( fabs(errorPos) > errorPosMax ) errorPosMax = fabs(errorPos);
+		}
+		posEdgeInitializedFlag = 1;
+	  }
+	  
+      if (velocitySign == IS_NEGATIVE )
+      {
+		edgeNeg = currentPos;
+		if ( negEdgeInitializedFlag == 0 ) {
+			initialEdgeNeg = edgeNeg;
+			errorNeg = 0;
+			errorNegMax = 0;
+		}
+		else {
+			errorNeg = initialEdgeNeg - edgeNeg;
+			if ( fabs(errorNeg) > errorNegMax ) errorNegMax = fabs(errorNeg);
+		}
+		negEdgeInitializedFlag = 1;
+	  }
+	  
+	  if ( fabs( errorNeg ) > position_tolerance ) {
+		fault_index_pulse_unexpected++;
+	  }
+	  else if ( fabs( errorPos ) > position_tolerance ) {
+		fault_index_pulse_unexpected++;
+	  }
+   
+      if ( ( negEdgeInitializedFlag == 1 ) && ( posEdgeInitializedFlag == 1 ) )
+	  {
+		// if edgeNeg > edgePos, there isn't a zero crossing.  
+		if ( edgeNeg >= edgePos ) centerPos = ( ( edgeNeg + edgePos ) / 2.0 );
+		else centerPos = fmod(( ( edgeNeg + unitsPerRev + edgePos ) / 2.0 ), unitsPerRev);
+		
+		// Capture the very first center of the index pulse as a reference
+		// to judge all future index pulses against.
+		if ( centerPosInitializedFlag == FALSE )
+		{
+			centerPosInitializedFlag == TRUE;
+			initialCenterPos = centerPos;
+	    }
+	  }
+  }	
+
+  
+  if ( LimSwitchLatcherState == INIT_DONE ) 
+  {
+	LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+  }
+    
+  // 
+  // 4 TRAVELING_NO_LIM_SW
+  //
+  if ( LimSwitchLatcherState == TRAVELING_NO_LIM_SW ) 
+  {
+	// If we are just cruising around and then we find a switch
+	// FIXME - FORCING INTO NEXT STATE
+	if ( home_sw_in == TRUE) 
+	{
+
+		homeSwitchLatched = TRUE;
+		switchDirection = velocitySign;
+		LimSwitchLatcherState = TRAVELING_INTO_SWITCH;
+
+	}
+	
+  }
+
+  if ( velocitySign == switchDirection )   {
+	travelDirection = TOWARDS_SWITCH;
+  }
+  else {
+	travelDirection = AWAY_FROM_SWITCH;
+  }
+
+  // 
+  //  8 - TRAVELING_INTO_SWITCH 
+  // 
+
+  // We have found a switch and are traveling into it
+  if ( LimSwitchLatcherState == TRAVELING_INTO_SWITCH) 
+  {
+	// Add check here to make sure that at least one edge in the
+	// direction of the switch has been found or we can't really
+	// find the center when we leave and ignoring that is betrayal.
+	
+	homeSwitchLatched = TRUE;  // we should turn on the home_sw_out bit
+    // if we start to head the other way, latch the switch
+	if (travelDirection = AWAY_FROM_SWITCH) {
+		LimSwitchLatcherState = REVERSED_EXITING_SWITCH; 
+	}
+	if ( jointHoming != TRUE ) LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+  }
+ 
+
+  // We are traveling out of the switch.  When it clears we will look for the prox
+  //
+  // 8
+  // 
+  if (LimSwitchLatcherState == REVERSED_EXITING_SWITCH) 
+  {
+    
+	homeSwitchLatched = TRUE; // We hold the home switch output 
+    // if we start to head the other way, latch the switch
+	if ( home_sw_in == 0 ) {
+		home_sw_last_detected_lin_position = position;
+		LimSwitchLatcherState = REVERSED_HUNTING_PROX; 
+	}
+	if ( jointHoming != TRUE ) LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+  }
+
+
+  // We have reversed directions and are now traveling away. 
+  // Hold the synthesized home_sw_out while hunting the prox.
+  // 
+  // 16 REVERSED_HUNTING_PROX
+  // 
+  if  (LimSwitchLatcherState == REVERSED_HUNTING_PROX) 
+  {
+	homeSwitchLatched = TRUE; // We hold the home switch output 
+	if ( (proxEdgeJustOcurredFlag == TRUE) && (home_sw_in == FALSE) )
+    {
+		// clear the proxEdge flag here to prevent tricking the next
+		// state.
+		proxEdgeJustOcurredFlag = FALSE;
+		LimSwitchLatcherState = HOLDING_UNTIL_CENTERPOINT;
+		
+    }
+    
+    if ( fabs( position - home_sw_last_detected_lin_position ) > (1.5 * unitsPerRev) )
+    {
+		fault_center_pos_seek_failure++;
+		LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+    }
+    
+    if ( jointHoming != TRUE ) LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+  }
+  
+
+  // We have reversed directions, found a prox edge, and
+  // are heading to the centerPos. 
+  // Hold the synthesized home_sw_out while hunting the
+  // centerpoint.
+  //
+  //  32
+  //
+  if (LimSwitchLatcherState == HOLDING_UNTIL_CENTERPOINT) 
+  {
+	
+	homeSwitchLatched = TRUE; // We hold the home switch output 
+	
+	// if we have entered this state and don't have both prox edge
+	// locations, this homing isn't valid.  We need to indicate
+	// a fault has occurred and drop out.
+	if ( !( ( negEdgeInitializedFlag == 1 ) && ( posEdgeInitializedFlag == 1 ) ) )
+    {
+		LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+		fault_no_prox_before_homesw++;	
+    }
+	
+	
+	// if we hit the centerPoint, back to just cruising around.
+	if ( centerPosCrossed )
+    {
+		LimSwitchLatcherState = TRAVELING_NO_LIM_SW;	
+    }
+	
+	// If we have held the home switch latched for 1.5 times the distance
+	// between pulses and haven't crossed the center position
+	// either it wasn't calculated or the prox fell off.
+    if ( fabs( position - home_sw_last_detected_lin_position ) > (1.5 * unitsPerRev) )
+    {
+		fault_center_pos_seek_failure++;
+		LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+    }
+ 
+    if ( jointHoming != TRUE ) LimSwitchLatcherState = TRAVELING_NO_LIM_SW;
+  }
+ 
+  // The home_sw_input OR the latch can keep the output on.
+  //home_sw_out = ( ( home_sw_in ) || (homeSwitchLatched == TRUE) );
+  home_sw_out = ( ( home_sw_in) || ( homeSwitchLatched  ) );
+    
+  lastProx = prox;
+  lastPos = currentPos; 
+  lastHomeSw = home_sw_in;
+  debugState = LimSwitchLatcherState;
+  lastPosLessThanCenter = currentPosLessThanCenter;
+} // End function
+
+int testfunc ( struct __comp_state *__comp_inst ) {
+  return 1;
+}
+
+// rollover_convert takes a number with a wrap value of unitsPerRev
+// and "unwinds" it so that it is from -0.5*upr to 0.5upr.
+// This makes dealing with number right at the zero crossing easier.
+float rollover_convert( float value, float upr) {
+	if (value > ( 0.5 * upr )) return ( value - upr );
+	else return ( value );
+}
+
+
+

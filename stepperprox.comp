@@ -108,6 +108,34 @@ pin out float centerPos = -1 "center of the prox pulse";
 pin out float switchDirection "direction the switch is in pos or neg";
 pin out float velocitySign "sign of our current movement pos or neg";
 pin out float debug_float = -1 "internal debugging pin";
+
+// per instance variables 
+
+variable int motionHappenedWithZeroProx = 0;
+variable int LimSwitchLatcherState;
+variable float lastPos;
+variable float lastLinearPos;
+variable int negEdgeInitializedFlag = 0;
+variable int posEdgeInitializedFlag = 0;
+  
+variable float initialEdgePos = 0;  // The last time the prox encountered
+                              // the prox what the position of the 
+                              // leadscrew was.
+variable float initialEdgeNeg = 0;  // Decreasing old edge position.
+  
+variable float home_sw_last_detected_lin_position;
+  
+variable int centerPosInitializedFlag = 0;
+variable int guardingLostStepsFlag = 0;
+
+variable float initialCenterPos = 0;
+  
+variable int selfInitCompletedFlag = 0;
+variable int lastProx;
+
+variable int lastHomeSw; // Last cycle value of the home switch so we can detect edges.
+variable int lastPosLessThanCenter;
+
 function _ ;
 ;;
 
@@ -133,36 +161,15 @@ float rollover_convert( float value, float upr);
 
 
 FUNCTION(_) {
-  static int motionHappenedWithZeroProx = 0;
-  static int LimSwitchLatcherState;
-  static float lastPos;
-  static float lastLinearPos;
-  static int negEdgeInitializedFlag = 0;
-  static int posEdgeInitializedFlag = 0;
-  
-  static float initialEdgePos = 0;  // The last time the prox encountered
-                              // the prox what the position of the 
-                              // leadscrew was.
-  static float initialEdgeNeg = 0;  // Decreasing old edge position.
-  
-  static float home_sw_last_detected_lin_position;
-  
-  static int centerPosInitializedFlag = 0;
-  static int guardingLostStepsFlag = 0;
+
+
   int homeSwitchLatched = FALSE;  // left volatile, because latching should be done
 							  // by the state machine state, not another flag.
-
-  static float initialCenterPos = 0;
-  
-  static int selfInitCompletedFlag = 0;
-  static int lastProx;
-  static int lastHomeSw; // Last cycle value of the home switch so we can detect edges.
   
   float currentPos;
   int travelDirection;
   int proxEdgeJustOcurredFlag = 0 ;
   int currentPosLessThanCenter;
-  static int lastPosLessThanCenter;
       
   debugState = 0;
 

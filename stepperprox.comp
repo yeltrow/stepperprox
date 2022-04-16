@@ -78,7 +78,7 @@ pin in float position_tolerance = 0.005
 """Set to a value that should not be exceeded during normal run without
 missed steps. If the toleranace is exceeded, a fault will be set.  It is
 up to you as a user to have the machine act appropriately when this 
-condition occurs.  Tying to joint.N.amp-fault-in is a way to handle
+condition occurs.  Tying a fault to joint.N.amp-fault-in is a way to handle
 this.  It will cause skipped steps everywhere if the amp-fault-in
 line is used.  Rehoming will be necessary afterwards. """;
 
@@ -109,6 +109,8 @@ pin out float velocitySign "sign of our current movement pos or neg";
 pin out float velocity_dir "sign of our current movement pos or neg";
 
 pin out float debug_float = -1 "internal debugging pin";
+
+pin out float edge_histogram# [200] "histogram of edge positions";
 
 // per instance variables 
 
@@ -171,8 +173,9 @@ FUNCTION(_) {
   
   float handwheel_pos;
   int travelDirection;
-  int proxEdgeJustOcurredFlag = 0 ;
+  int proxEdgeJustOccurredFlag = 0 ;
   int handwheel_pos_lt_center;
+  int init_index;
       
   debugState = 0;
 
@@ -208,7 +211,7 @@ FUNCTION(_) {
 	initialCenterPos = 0;
 	selfInitCompletedFlag = 1;
 	homeSwitchLatched = 0;
-	proxEdgeJustOcurredFlag = 0;
+	proxEdgeJustOccurredFlag = 0;
 	LimSwitchLatcherState = INIT_DONE;
 	fault_no_prox_before_homesw = 0;
 	fault_index_pulse_unexpected = 0;
@@ -217,6 +220,10 @@ FUNCTION(_) {
 	lastLinearPos = position;
 	old_position = position;
 	velocity_dir = 0;
+	for (init_index=0; init_index<200; init_index++)
+	{
+		edge_histogram(init_index)=0;
+	}
   }	
   
 
@@ -263,14 +270,19 @@ FUNCTION(_) {
  
   if  ((lastProx == 0) && (prox == 1) && ( motionHappenedWithZeroProx ==TRUE ) )
   {
-	proxEdgeJustOcurredFlag = TRUE;
+	proxEdgeJustOccurredFlag = TRUE;
 	lastLinearPos = position;  // update the last position we saw the prox switch
 	                           // alive.  
   }
 
+  if (proxEdgeJustOccurredFlag == TRUE) {
+	edge_histogram((int)(handwheel_pos*(200.0/unitsPerRev)))++;
+  }
+  
+
   // Any time we encounter a prox edge, capture it and calculate the
   // Center value
-  if ( proxEdgeJustOcurredFlag )
+  if ( proxEdgeJustOccurredFlag )
   {
 	  if ( velocity_dir == IS_POSITIVE ){
 		edgePos = handwheel_pos;
@@ -400,11 +412,11 @@ FUNCTION(_) {
   if  (LimSwitchLatcherState == REVERSED_HUNTING_PROX) 
   {
 	homeSwitchLatched = TRUE; // We hold the home switch output 
-	if ( (proxEdgeJustOcurredFlag == TRUE) && (home_sw_in == FALSE) )
+	if ( (proxEdgeJustOccurredFlag == TRUE) && (home_sw_in == FALSE) )
     {
 		// clear the proxEdge flag here to prevent tricking the next
 		// state.
-		proxEdgeJustOcurredFlag = FALSE;
+		proxEdgeJustOccurredFlag = FALSE;
 		LimSwitchLatcherState = HOLDING_UNTIL_CENTERPOINT;
 		
     }

@@ -90,6 +90,7 @@ pin out float testCounter=0 "Counter used for debugging. Increments each time it
 param rw float unitsPerRev = 0.200 "units between prox pulses";
 
 pin out float edgePos "Edge position when shaft is rotating in the positive direction";
+pin out float edgeCapPos "Edge position when shaft is rotating in the positive direction";
 
 pin out float errorPos 
 """Differrence between the position of the last positve edge and the very
@@ -98,6 +99,7 @@ first one ever found.""";
 pin out float errorPosMax "Maximum Pos Edge Error."; 
 
 pin out float edgeNeg "Edge position when shaft is rotating in the negative direction";
+pin out float edgeCapNeg "Edge position when shaft is rotating in the negative direction";
 pin out float errorNeg 
 """Differrence between the position of the last negative edge and the very
 first one ever found.""";
@@ -116,8 +118,16 @@ pin out float edge_histogram# [200] "histogram of edge positions";
 
 variable int motionHappenedWithZeroProx = 0;
 variable int LimSwitchLatcherState;
+// The edge capture state machine
+variable int EdgeCaptureState = 0;  
+variable int EdgeCaptureTimeInState = 0;  
 variable float lastPos;
 variable float lastLinearPos;
+// The number of cycles before and after the prox switch was triggered
+variable int neg_dir_counts_preprox = 0;
+variable int neg_dir_counts_postprox = 0;
+variable int pos_dir_counts_preprox = 0;
+variable int pos_dir_counts_postprox = 0;
 variable int negEdgeInitializedFlag = 0;
 variable int posEdgeInitializedFlag = 0;
   
@@ -125,6 +135,10 @@ variable float initialEdgePos = 0;  // The last time the prox encountered
                               // the prox what the position of the 
                               // leadscrew was.
 variable float initialEdgeNeg = 0;  // Decreasing old edge position.
+
+variable float FrozenEdge = 0;  // temporary edge position
+
+
   
 variable float home_sw_last_detected_lin_position;
   
@@ -137,16 +151,26 @@ variable int selfInitCompletedFlag = 0;
 variable int lastProx;
 
 variable double old_position;
+variable int velocity_dir_old = 1;
 
 variable int lastHomeSw; // Last cycle value of the home switch so we can detect edges.
 variable int old_handwheel_pos_lt_center;
+
 
 function _ ;
 ;;
 
 float rollover_convert( float value, float upr);
 
-  // States
+// Edge Validation State Machine States
+#define PRE_PROX_COUNTING 0  // Counting up to N off states 
+#define EDGE_CAPTURE_POS 1   // N off states complete and edge found
+#define POST_PROX_COUNTING 2 // M on states of the prox to validate edge
+#define EDGE_WRITE_POS 3     // Write valid edge and check errors
+#define CHECK_EDGE_FAULTS 4  // Finished capturing values, now check errors
+
+
+  // Synthesized Home Signal State Machine States
   
 #define UNINTIALIZED 0  			// Reset - Uninitialized
 #define INIT_DONE 1		 		// Init complete, just hanging out
@@ -172,27 +196,41 @@ FUNCTION(_) {
 							  // by the state machine state, not another flag.
   
   float handwheel_pos;
+  float velocity;
+  float speed;
+  int axis_in_motion=FALSE;
   int travelDirection;
   int proxEdgeJustOccurredFlag = 0 ;
   int handwheel_pos_lt_center;
   int init_index;
+ 
       
   debugState = 0;
 
+  velocity = ( (double)position - (double)old_position );
+  speed = fabs(velocity);
+  if (speed >= (double)0.0) {
+	axis_in_motion = TRUE;
+  }
+  
   // if we startup linuxcnc on the prox switch, we will get a detected prox edge
   // when we shouldn't.  
-  if (( vel_cmd != 0 ) && ( prox == 0 ) )
+  if (( axis_in_motion == TRUE ) && ( prox == 0 ) )
   {
 	// we have been moving without the prox active;
 	motionHappenedWithZeroProx = 1;
   }
   
+  // MRW velocitySign is only used to compare the velocity command vs. the
+  // computed velocity sign for debugging.  This can be deleted after 
+  // testing.
   if (vel_cmd >= 0) velocitySign = IS_POSITIVE;
   else velocitySign = IS_NEGATIVE;
     
   if (( (double)position - (double)old_position ) >= (double)0.0 ) velocity_dir = IS_POSITIVE;
   else velocity_dir = IS_NEGATIVE;
   
+ 
   debug_float = old_position;
   
   if (velocity_dir != velocitySign) testCounter++;
@@ -275,67 +313,136 @@ FUNCTION(_) {
 	                           // alive.  
   }
 
+
+  //
+  // HISTOGRAM POPULATION 
+  //
   if (proxEdgeJustOccurredFlag == TRUE) {
+    // Note that because we are using halcompile, arrays use PARENTHESIS 
+    // to get to the element subsripts!
 	edge_histogram((int)(handwheel_pos*(200.0/unitsPerRev)))++;
   }
-  
 
   // Any time we encounter a prox edge, capture it and calculate the
   // Center value
   if ( proxEdgeJustOccurredFlag )
   {
-	  if ( velocity_dir == IS_POSITIVE ){
-		edgePos = handwheel_pos;
-		if ( posEdgeInitializedFlag == 0 ) {
+	  
+   
+	  // Center position calculations
+	  
+
+  }	
+
+  //
+  // Edge Latcher State Machine Logic 
+  //
+
+  // If the axis is moving, count how many steps we have made in a given
+  // direction with the prox off and on.  
+  // If we have > 3 off and then greater than 3 on we can be sure we have
+  // a clean egde.  A clean edge will be used for all of the fault detection
+  // algorithms.  
+  // This will be used to reject any edge captures that happen
+  // as a result of fluttering on a prox target.
+  if (axis_in_motion) {
+	  if (EdgeCaptureState == PRE_PROX_COUNTING) {
+		if (velocity_dir == velocity_dir_old) {
+			EdgeCaptureTimeInState++;
+			if (EdgeCaptureTimeInState > 3) EdgeCaptureTimeInState=3;
+		}
+		else {
+			EdgeCaptureTimeInState=0;
+		}
+		if ((EdgeCaptureTimeInState>2) && (prox == TRUE)) {
+		   EdgeCaptureState = EDGE_CAPTURE_POS;
+		   EdgeCaptureTimeInState=0;
+		}
+		if (prox == TRUE) EdgeCaptureTimeInState=0;
+	  }
+	  
+	  if (EdgeCaptureState == EDGE_CAPTURE_POS) {
+		FrozenEdge = handwheel_pos;
+		EdgeCaptureTimeInState=0;
+		EdgeCaptureState = POST_PROX_COUNTING;
+	  }
+	  
+	  if (EdgeCaptureState == POST_PROX_COUNTING) {
+		if (prox == FALSE) {
+		  EdgeCaptureTimeInState=0;
+		  EdgeCaptureState = PRE_PROX_COUNTING;
+		}
+		else {
+		  // If we switch directions, throw out the result
+		  if (velocity_dir != velocity_dir_old) {
+		    EdgeCaptureTimeInState=0;
+		    EdgeCaptureState = PRE_PROX_COUNTING;
+		  }
+		  else {
+		    EdgeCaptureTimeInState++;
+		    if (EdgeCaptureTimeInState > 3) {
+     		  EdgeCaptureTimeInState=0;
+   		      EdgeCaptureState = EDGE_WRITE_POS;
+  		    }
+		  }
+  	    }
+		
+	  }
+ 	  if (EdgeCaptureState == EDGE_WRITE_POS) {
+		if (velocity_dir == IS_POSITIVE)
+		{
+		  edgeCapPos = FrozenEdge;
+		  edgePos = FrozenEdge;
+    	  if ( posEdgeInitializedFlag == 0 ) {
 			initialEdgePos = edgePos;
 			errorPos = 0;
 			errorPosMax = 0;
-		}
-		else {
+  		  }
+		  else {
 			errorPos = initialEdgePos - edgePos;
 			if ( fabs(errorPos) > errorPosMax ) errorPosMax = fabs(errorPos);
+		  }
+		  posEdgeInitializedFlag = 1;
 		}
-		posEdgeInitializedFlag = 1;
-	  }
-	  
-      if (velocity_dir == IS_NEGATIVE )
-      {
-		edgeNeg = handwheel_pos;
-		if ( negEdgeInitializedFlag == 0 ) {
+		else {
+		  edgeCapNeg = FrozenEdge;
+    	  edgeNeg = FrozenEdge;
+		  if ( negEdgeInitializedFlag == 0 ) {
 			initialEdgeNeg = edgeNeg;
 			errorNeg = 0;
 			errorNegMax = 0;
-		}
-		else {
+		  }
+		  else {
 			errorNeg = initialEdgeNeg - edgeNeg;
 			if ( fabs(errorNeg) > errorNegMax ) errorNegMax = fabs(errorNeg);
+		  }
+		  negEdgeInitializedFlag = 1;
 		}
-		negEdgeInitializedFlag = 1;
+  	    EdgeCaptureTimeInState=0;
+		EdgeCaptureState = CHECK_EDGE_FAULTS;
+		
+		// Calculate the center position between the two prox edges.
+		
+		if ( ( negEdgeInitializedFlag == 1 ) && ( posEdgeInitializedFlag == 1 ) )
+		{
+		  // if edgeNeg > edgePos, there isn't a zero crossing.  
+		  if ( edgeNeg >= edgePos ) centerPos = ( ( edgeNeg + edgePos ) / 2.0 );
+		  else centerPos = fmod(( ( edgeNeg + unitsPerRev + edgePos ) / 2.0 ), unitsPerRev);
+		}
 	  }
 	  
-	  if ( fabs( errorNeg ) > position_tolerance ) {
-		fault_index_pulse_unexpected++;
-	  }
-	  else if ( fabs( errorPos ) > position_tolerance ) {
-		fault_index_pulse_unexpected++;
-	  }
-   
-      if ( ( negEdgeInitializedFlag == 1 ) && ( posEdgeInitializedFlag == 1 ) )
-	  {
-		// if edgeNeg > edgePos, there isn't a zero crossing.  
-		if ( edgeNeg >= edgePos ) centerPos = ( ( edgeNeg + edgePos ) / 2.0 );
-		else centerPos = fmod(( ( edgeNeg + unitsPerRev + edgePos ) / 2.0 ), unitsPerRev);
-		
-		// Capture the very first center of the index pulse as a reference
-		// to judge all future index pulses against.
-		if ( centerPosInitializedFlag == FALSE )
-		{
-			centerPosInitializedFlag == TRUE;
-			initialCenterPos = centerPos;
+ 	  if (EdgeCaptureState == CHECK_EDGE_FAULTS) {
+ 	    // Fault Error Exceeds threshold
+	  	if ( fabs( errorNeg ) > position_tolerance ) {
+		  fault_index_pulse_unexpected++;
 	    }
+	    else if ( fabs( errorPos ) > position_tolerance ) {
+		  fault_index_pulse_unexpected++;
+	    }
+		EdgeCaptureTimeInState=0;
+		EdgeCaptureState = PRE_PROX_COUNTING;
 	  }
-  }	
-
+  }
   
   if ( LimSwitchLatcherState == INIT_DONE ) 
   {
@@ -478,9 +585,10 @@ FUNCTION(_) {
   lastProx = prox;
   lastPos = handwheel_pos; 
   lastHomeSw = home_sw_in;
-  debugState = LimSwitchLatcherState;
+  debugState = EdgeCaptureTimeInState;
   old_handwheel_pos_lt_center = handwheel_pos_lt_center;
   old_position = (double)position;
+  velocity_dir_old = velocity_dir;
 } // End function
 
 int testfunc ( struct __comp_state *__comp_inst ) {

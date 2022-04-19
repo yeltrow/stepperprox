@@ -209,7 +209,7 @@ FUNCTION(_) {
 
   velocity = ( (double)position - (double)old_position );
   speed = fabs(velocity);
-  if (speed >= (double)0.0) {
+  if (speed > (double)0.0) {
 	axis_in_motion = TRUE;
   }
   
@@ -442,6 +442,12 @@ FUNCTION(_) {
 		EdgeCaptureTimeInState=0;
 		EdgeCaptureState = PRE_PROX_COUNTING;
 	  }
+  }
+  // If we are not moving at any time during the state machine, 
+  // reset back to the base condition.
+  else {
+	EdgeCaptureTimeInState=0;
+	EdgeCaptureState = PRE_PROX_COUNTING;
   }
   
   if ( LimSwitchLatcherState == INIT_DONE ) 
